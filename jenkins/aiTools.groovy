@@ -11,6 +11,7 @@
 import groovy.transform.Field
 
 @Field final int MAX_OUTPUT = 40000
+@Field List writtenFiles = []   // files write_file touched this build, for show_changes
 
 // ---------------------------------------------------------------------------
 // Specs sent to the model: name, description, input_schema (JSON Schema)
@@ -103,6 +104,27 @@ List definitions() {
                 required: ['path', 'content'],
             ],
         ],
+        [
+            name: 'show_changes',
+            description: 'Show what has changed in the workspace: git status, the diff of changed files, and the content of new files. Also lists the files the agents wrote this build. Use it to review changes before they run.',
+            input_schema: [
+                type: 'object',
+                properties: [
+                    path: [type: 'string', description: "Only show changes under this file or directory. Default '.'."],
+                ],
+            ],
+        ],
+        [
+            name: 'revert_file',
+            description: 'Undo the changes to one file: restore it from the last commit, or delete it if it is new. Use it to clean up a wrong or unneeded change.',
+            input_schema: [
+                type: 'object',
+                properties: [
+                    path: [type: 'string', description: 'File path relative to the workspace.'],
+                ],
+                required: ['path'],
+            ],
+        ],
     ]
 }
 
@@ -112,7 +134,7 @@ List definitions() {
 String run(String name, Map input) {
     input = input ?: [:]
     // The controller's disk holds every Jenkins secret, so no shell or writes there.
-    if (name in ['run_shell', 'write_file'] && env.NODE_NAME in ['built-in', 'master']) {
+    if (name in ['run_shell', 'write_file', 'revert_file'] && env.NODE_NAME in ['built-in', 'master']) {
         error("${name} is turned off when the build runs on the Jenkins controller. Use the read-only tools.")
     }
     switch (name) {
@@ -123,6 +145,8 @@ String run(String name, Map input) {
         case 'search_files':   return searchFiles(input)
         case 'run_shell':      return runShell(input)
         case 'write_file':     return writeWorkspaceFile(input)
+        case 'show_changes':   return showChanges(input)
+        case 'revert_file':    return revertFile(input)
     }
     error("Unknown tool '${name}'.")
 }
@@ -308,22 +332,79 @@ grep ${flags} --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.ai ${
     return clip(out) ?: 'No matches.'
 }
 
+// Every command and its output is also appended to .ai/output.txt (see outputLog()).
 String runShell(Map input) {
     if (!input.command) error('command is required')
     def secs = Math.max(1, Math.min(1800, (input.timeout_seconds ?: 300) as int))
     writeFile file: '.ai/cmd.sh', text: input.command as String
-    def rc
-    timeout(time: secs, unit: 'SECONDS') {
-        rc = sh(returnStatus: true, label: 'AI: run_shell', script: '#!/bin/bash\nbash .ai/cmd.sh > .ai/cmd.out 2>&1')
+    // The shell's own timeout, not the timeout step: that one would abort the whole build.
+    def rc = sh(returnStatus: true, label: 'AI: run_shell', script: """#!/bin/bash
+if command -v timeout >/dev/null 2>&1; then timeout -k 10 ${secs} bash .ai/cmd.sh; else bash .ai/cmd.sh; fi > .ai/cmd.out 2>&1
+""")
+    withEnv(["AI_RC=${rc}"]) {
+        sh '#!/bin/sh\n{ printf \'\\n$ \'; cat .ai/cmd.sh; printf \'\\n[exit %s]\\n\' "$AI_RC"; cat .ai/cmd.out; } >> .ai/output.txt'
     }
-    return clip("exit ${rc}\n${readFile('.ai/cmd.out')}")
+    def note = rc == 124 ? " (timed out after ${secs}s)" : ''
+    return clip("exit ${rc}${note}\n${readFile('.ai/cmd.out')}")
+}
+
+// The last maxChars characters of everything run_shell ran since the last reset.
+String outputLog(int maxChars) {
+    if (!fileExists('.ai/output.txt')) return '(nothing was run)'
+    return sh(returnStdout: true, script: "#!/bin/sh\ntail -c ${maxChars} .ai/output.txt")
+}
+
+void resetOutputLog() {
+    sh '#!/bin/sh\nrm -f .ai/output.txt'
 }
 
 String writeWorkspaceFile(Map input) {
     def file = safePath(input.path)
     def content = (input.content ?: '') as String
     writeFile file: file, text: content
+    if (!(file in writtenFiles)) writtenFiles << file
     return "Wrote ${content.length()} characters to ${file}."
+}
+
+// The build's own files (.ai/, ai-result.md, ai-output.txt) are left out.
+@Field final String NOT_OURS = "':(exclude).ai' ':(exclude)ai-result.md' ':(exclude)ai-output.txt'"
+
+String showChanges(Map input) {
+    def where = q(safePath(input.path ?: '.'))
+    def out = sh(returnStdout: true, script: """#!/bin/sh
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo '(the workspace is not a git repository, so there is no diff)'
+  exit 0
+fi
+echo '--- git status ---'
+git status --short -- ${where} ${NOT_OURS}
+echo '--- diff of changed files ---'
+git diff HEAD -- ${where} ${NOT_OURS} 2>/dev/null || git diff -- ${where} ${NOT_OURS}
+git ls-files --others --exclude-standard -- ${where} ${NOT_OURS} | head -n 50 | while IFS= read -r f; do
+  echo "--- new file \$f ---"
+  head -c 4000 "\$f"
+  echo
+done
+""")
+    def written = writtenFiles ? "Files the agents wrote this build: ${writtenFiles.join(', ')}" : 'The agents have not written any files this build.'
+    return clip(out.trim() + '\n\n' + written)
+}
+
+String revertFile(Map input) {
+    def file = safePath(input.path)
+    if (file in ['', '.', './'] || file.startsWith('.git') || file.startsWith('.ai')) error("Can't revert '${file}'. Give one file.")
+    def out = sh(returnStdout: true, script: """#!/bin/sh
+f=${q(file)}
+if git ls-files --error-unmatch -- "\$f" >/dev/null 2>&1; then
+  git checkout HEAD -- "\$f" 2>&1 && echo "Restored \$f from the last commit."
+elif [ -f "\$f" ]; then
+  rm -f -- "\$f" && echo "Deleted new file \$f."
+else
+  echo "\$f is not a file; nothing to revert."
+fi
+""").trim()
+    writtenFiles.remove(file)
+    return out
 }
 
 // ---------------------------------------------------------------------------

@@ -1,24 +1,35 @@
 # AI task runner for Jenkins (Claude Opus on Bedrock)
 
-One Jenkins parameter, `TASK` (multiline). The build sends it to Claude Opus on Amazon
-Bedrock, and the model carries it out in the job's workspace using the tools in
-`jenkins/aiTools.groovy`. There's no server and no UI. Everything happens inside the
-build:
+Parameters `TEAM`, `ORG`, `APP` and a multiline `TASK`. Four Claude agents on Amazon
+Bedrock take the task through a cycle inside the build. There's no server and no UI.
 
 ```
-TASK ──▶ Jenkinsfile loop ──aws bedrock-runtime converse──▶ Bedrock
-              ▲                                                 │
-              └──── tool result ◀── aiTools.groovy ◀── tool call┘
+TASK ─▶ Builder ─▶ Validator ─▶ Runner ─▶ Output validator ─▶ pass: done
+           ▲          │ fail       │ fail         │ fail
+           └──────────┴────────────┴──────────────┘  (next cycle, up to MAX_CYCLES)
 ```
 
-The console log shows every model reply, tool call and result. The final answer is
-archived as `ai-result.md`.
+| Agent | Job | Tools |
+|---|---|---|
+| Builder | Makes the changes the task asks for. Reports every file changed and why, and the commands to run | read tools, `write_file`, `revert_file` |
+| Validator | Fresh conversation, its own prompt. Checks the changes against the task: versions, configs, the reason for each change, bugs. Fixes small mistakes and reverts bad changes itself (`fixed`), or sends it back (`fail`) | read tools, `write_file`, `revert_file` |
+| Runner | Runs it in the shell (build, test, push), doesn't edit. Errors go back to the builder | read tools, `run_shell` |
+| Output validator | Checks the run's output text against the task. Can question the builder, validator or runner with `ask_agent` (they answer read-only, in a fresh turn) | read tools, `ask_agent` |
+
+Each agent ends its turn by calling `finish` with a status and a report, which is how
+the Jenkinsfile decides where to go next. A failed check's findings go to the builder in
+the next cycle.
+
+The console log shows each agent's stages, replies, tool calls and results. The build
+archives `ai-result.md` (every cycle's reports, with the model and `PROMPT_VERSION`) and
+`ai-output.txt` (every command the runner ran and its output). The build fails if no
+cycle passes.
 
 ## Files
 
 | Path | What it is |
 |---|---|
-| `Jenkinsfile` | The `TASK` parameter, Bedrock credentials, and the agent loop |
+| `Jenkinsfile` | Parameters, Bedrock credentials, the four agents' prompts and tools, the cycle, and the agent loop |
 | `jenkins/aiTools.groovy` | Tool specs sent to the model and their Groovy implementations |
 
 ## Tools
@@ -32,10 +43,13 @@ archived as `ai-result.md`.
 | `search_files` | grep across the workspace |
 | `run_shell` | Run bash in the workspace (exit code + output) |
 | `write_file` | Create or overwrite a file |
+| `show_changes` | git status, diff and new files, plus the files the agents wrote |
+| `revert_file` | Restore a file from the last commit, or delete it if new |
 
-The model gets these specs with every request, and the system prompt tells it they
-run on the Jenkins agent. To add a tool, add a spec to `definitions()` and a `case` to
-`run()`.
+Read tools are `get_build_info`, `list_files`, `read_file`, `search_func`,
+`search_files` and `show_changes`. To add a tool, add a spec to `definitions()` and a
+`case` to `run()`, then add its name to the agents that should have it in `agents()` in
+the Jenkinsfile.
 
 ### Where `search_func` looks
 
@@ -47,7 +61,7 @@ run on the Jenkins agent. To add a tool, add a spec to `definitions()` and a `ca
   `jenkins.plugins.nodejs.tools.NodeJSInstallation.xml`). That only works when the build
   runs on the controller (built-in node). On an agent, the tool says it can't see them
   and suggests trying the name directly. It never reads `credentials.xml` or `secrets/`.
-- When the build runs on the controller, `run_shell` and `write_file` are turned off,
+- When the build runs on the controller, `run_shell`, `write_file` and `revert_file` are turned off,
   because the controller's disk holds every Jenkins secret.
 
 The model can run any shell command on the agent with the build's permissions. Run
@@ -61,8 +75,9 @@ this job on an agent you're fine with that on, and restrict who can start it.
    `bedrock:InvokeModel` on the model.
 3. Turn on model access for Claude Opus in the Bedrock console.
 4. Check the settings at the top of the `Jenkinsfile`: `AI_MODEL`, `AI_REGION`,
-   `CREDENTIALS_ID`, `MAX_STEPS`, `MAX_TOKENS`. If your region serves Opus through a
+   `CREDENTIALS_ID`, `MAX_CYCLES`, `MAX_STEPS`, `MAX_TOKENS`. Bump `PROMPT_VERSION`
+   when you change an agent's prompt. If your region serves Opus through a
    cross-region inference profile, set `AI_MODEL` to that profile's ID
    (`aws bedrock list-inference-profiles`).
 5. Create a Pipeline job from this `Jenkinsfile`. The first run only registers the
-   parameter. After that, use "Build with Parameters" and type the task.
+   parameters. After that, use "Build with Parameters" and type the task.
