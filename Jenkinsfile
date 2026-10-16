@@ -63,6 +63,7 @@ String runAgent(def tools, String task, int maxSteps, int maxTokens) {
     def system = [[text: """You are an engineer working inside a Jenkins build (job ${env.JOB_NAME}, build #${env.BUILD_NUMBER}).
 Your working directory is the build workspace: ${env.WORKSPACE}.
 Carry out the task you are given using your tools. Every tool call runs for real on the Jenkins agent.
+Use what the company already has before writing anything new: search_func finds functions in the workspace, the company's Jenkins shared-library steps, and this Jenkins's agents, labels and tool installations (Node.js versions, JDKs, Maven...).
 Look before you change things: use search_func, search_files and read_file to find the code involved.
 Work step by step and check your results (for example, run the build or tests after a change).
 When you are done, reply with a short summary of what you did and anything that still needs attention. Use Markdown."""]]

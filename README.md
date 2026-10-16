@@ -28,7 +28,7 @@ archived as `ai-result.md`.
 | `get_build_info` | Job, build, agent, workspace, git branch/commit, non-secret env vars |
 | `list_files` | Recursive listing of the workspace |
 | `read_file` | Read a file (by line range) |
-| `search_func` | Find where a function is defined, by name: `def`, `function`, `func`, `fn`, `fun`, Go methods, JS arrow functions and assignments, Java/C-style methods, shell functions |
+| `search_func` | Find what already exists, in three places: function definitions in the workspace; the company's shared-library steps (`vars/`, with help text and `call()` signatures) and `src/` classes; and this Jenkins's agents, labels and tool installations such as `node22`, JDKs, Maven and Gradle |
 | `search_files` | grep across the workspace |
 | `run_shell` | Run bash in the workspace (exit code + output) |
 | `write_file` | Create or overwrite a file |
@@ -36,6 +36,19 @@ archived as `ai-result.md`.
 The model gets these specs with every request, and the system prompt tells it they
 run on the Jenkins agent. To add a tool, add a spec to `definitions()` and a `case` to
 `run()`.
+
+### Where `search_func` looks
+
+- **Shared libraries:** Jenkins checks out every library a build loads into
+  `<workspace>@libs/`. Add your company's `@Library('...') _` line to the Jenkinsfile,
+  or mark the libraries "load implicitly" in Jenkins, so they're there to search.
+- **Agents, labels and tools:** read from the controller's `$JENKINS_HOME`
+  (`nodes/*/config.xml`, `config.xml`, and the tool XML files such as
+  `jenkins.plugins.nodejs.tools.NodeJSInstallation.xml`). That only works when the build
+  runs on the controller (built-in node). On an agent, the tool says it can't see them
+  and suggests trying the name directly. It never reads `credentials.xml` or `secrets/`.
+- When the build runs on the controller, `run_shell` and `write_file` are turned off,
+  because the controller's disk holds every Jenkins secret.
 
 The model can run any shell command on the agent with the build's permissions. Run
 this job on an agent you're fine with that on, and restrict who can start it.

@@ -48,16 +48,21 @@ List definitions() {
         ],
         [
             name: 'search_func',
-            description: 'Find where a function or method is defined, by name. Recognizes common definition forms (def, function, func, fn, fun, sub, arrow functions and assignments, Java/C-style methods). Returns each definition as path:line with the lines that follow it. Use this before search_files when you know the function name.',
+            description: 'Find what already exists before building anything yourself. Searches three places: ' +
+                '(1) workspace code: where a function is defined (def, function, func, fn, fun, sub, arrow functions, Java/C-style methods, shell functions); ' +
+                "(2) the company's Jenkins shared libraries loaded by this build: global steps in vars/ (with their help text and call() signatures) and functions in src/; " +
+                '(3) this Jenkins instance: agents with their labels, and tool installations such as Node.js versions (e.g. node22), JDKs, Maven and Gradle, with the name and type to use in the tool step. ' +
+                'Leave name empty to list everything in a scope: all shared-library steps, or every agent, label and tool.',
             input_schema: [
                 type: 'object',
                 properties: [
-                    name   : [type: 'string', description: 'Function or method name, e.g. buildImage or parse_config.'],
-                    path   : [type: 'string', description: "Directory or file relative to the workspace. Default '.'."],
-                    include: [type: 'string', description: "Only search files matching this glob, e.g. '*.groovy'."],
-                    context: [type: 'integer', description: 'Lines to show after each definition (0-60). Default 15.'],
+                    name   : [type: 'string', description: 'Function, step, agent, label or tool name, e.g. deployApp, buildImage, node22. Empty lists everything in the scope.'],
+                    scope  : [type: 'string', enum: ['all', 'workspace', 'libraries', 'jenkins'],
+                              description: 'Where to look: workspace code, shared libraries, Jenkins agents/labels/tools, or all (default).'],
+                    path   : [type: 'string', description: "For workspace: directory or file relative to the workspace. Default '.'."],
+                    include: [type: 'string', description: "For workspace and libraries: only search files matching this glob, e.g. '*.groovy'."],
+                    context: [type: 'integer', description: 'Lines to show after each function definition (0-60). Default 15.'],
                 ],
-                required: ['name'],
             ],
         ],
         [
@@ -106,6 +111,10 @@ List definitions() {
 
 String run(String name, Map input) {
     input = input ?: [:]
+    // The controller's disk holds every Jenkins secret, so no shell or writes there.
+    if (name in ['run_shell', 'write_file'] && env.NODE_NAME in ['built-in', 'master']) {
+        error("${name} is turned off when the build runs on the Jenkins controller. Use the read-only tools.")
+    }
     switch (name) {
         case 'get_build_info': return getBuildInfo()
         case 'list_files':     return listFiles(input)
@@ -159,13 +168,44 @@ echo "--- from line ${start}; the file has \$(wc -l < ${q(file)}) lines ---"
 }
 
 String searchFunc(Map input) {
-    def name = (input.name ?: '') as String
-    // The name goes into a regex, so only identifier characters (plus . for Class.method).
-    if (!(name ==~ /[A-Za-z_$][A-Za-z0-9_$.]*/)) error("'${name}' is not a function name.")
-    def n = name.tokenize('.').last().replace('$', '\\$')
-    def where = safePath(input.path ?: '.')
-    def include = input.include ? "--include=${q(input.include as String)}" : ''
+    def name = ((input.name ?: '') as String).trim()
+    def scope = (input.scope ?: 'all') as String
+    if (name && !(name ==~ '[A-Za-z0-9_$.@+\\-]+')) error("'${name}' is not a name to search for.")
+    // Function search builds a regex from the name, so it needs an identifier (or Class.method).
+    def isIdent = name ==~ '[A-Za-z_$][A-Za-z0-9_$.]*'
     def context = Math.max(0, Math.min(60, (input.context == null ? 15 : input.context) as int))
+    def include = input.include ? "--include=${q(input.include as String)}" : ''
+    def sections = []
+
+    if (scope in ['all', 'workspace'] && isIdent) {
+        def out = findDefinitions(q(safePath(input.path ?: '.')), name, include, context)
+        sections << "== Workspace code ==\n" + (out ?: "No definition of '${name}' in the workspace.")
+    }
+    if (scope in ['all', 'libraries']) {
+        def out
+        withEnv(["AI_NAME=${isIdent ? name : ''}", "AI_CONTEXT=${context}"]) {
+            out = sh(returnStdout: true, label: 'AI: search shared libraries', script: LIBRARY_STEPS_SH).trim()
+        }
+        if (name && isIdent) {
+            def defs = findDefinitions('"$WORKSPACE@libs"', name, include, context)
+            if (defs) out += "\nFunctions named ${name}:\n" + defs
+        }
+        sections << "== Shared libraries (${env.WORKSPACE}@libs) ==\n" + (out ?: "Nothing named '${name}' in the shared libraries.")
+    }
+    if (scope in ['all', 'jenkins']) {
+        def out
+        withEnv(["AI_FILTER=${name}"]) {
+            out = sh(returnStdout: true, label: 'AI: list Jenkins agents and tools', script: JENKINS_INVENTORY_SH).trim()
+        }
+        sections << "== Jenkins agents, labels and tools ==\n" + out
+    }
+    if (!sections) error("'${name}' isn't a function name; search it with scope 'jenkins' or 'all'.")
+    return clip(sections.join('\n\n'))
+}
+
+// grep for definitions of a function; `where` is already shell-quoted.
+String findDefinitions(String where, String name, String include, int context) {
+    def n = name.tokenize('.').last().replace('$', '\\$')
     // Definition forms, one alternative each:
     //   def/function/func/fn/fun/sub/proc NAME      (Groovy, Python, JS, Go, Rust, Kotlin, Perl, Tcl)
     //   func (r *T) NAME                            (Go methods)
@@ -180,12 +220,82 @@ String searchFunc(Map input) {
         "^[[:space:]]*${n}[[:space:]]*\\(\\)[[:space:]]*\\{",
     ]
     def args = patterns.collect { "-e ${q(it)}" }.join(' ')
-    def out = sh(returnStdout: true, script: """#!/bin/sh
-grep -rnIE -A ${context} --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.ai ${include} ${args} -- ${q(where)} 2>/dev/null \\
+    return sh(returnStdout: true, script: """#!/bin/sh
+grep -rnIE -A ${context} --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.ai ${include} ${args} -- ${where} 2>/dev/null \\
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(return|if|while|for|switch|else|new|throw|await)[[:space:](]' | head -n 600
-""")
-    return clip(out) ?: "No definition of '${name}' found. Try search_files with the name to find where it is used or imported."
+""").trim()
 }
+
+// Shared libraries are checked out next to the workspace, in <workspace>@libs/<library>/.
+// A global step is vars/<step>.groovy (optional help in vars/<step>.txt) and runs its call() methods.
+@Field final String LIBRARY_STEPS_SH = '''#!/bin/sh
+libs="$WORKSPACE@libs"
+if [ ! -d "$libs" ]; then
+  echo "This build has no shared libraries checked out (no $libs). Load them with @Library in the Jenkinsfile, or mark them implicitly loaded in Jenkins."
+  exit 0
+fi
+if [ -z "$AI_NAME" ]; then
+  echo "Global steps (call them like built-in steps, e.g. stepName(...)):"
+  for f in "$libs"/*/vars/*.groovy; do
+    [ -e "$f" ] || continue
+    help="${f%.groovy}.txt"
+    about=""
+    [ -e "$help" ] && about=$(sed -e 's/<[^>]*>//g' "$help" | tr -s ' \\n' ' ' | cut -c1-140)
+    echo "  $(basename "$f" .groovy)  ($(echo "$f" | sed "s|^$libs/||"))  $about"
+  done
+  echo "Classes in src/:"
+  find "$libs"/*/src -name '*.groovy' 2>/dev/null | sed "s|^$libs/[^/]*/src/||; s|\\.groovy$||; s|/|.|g; s|^|  |" | sort | head -n 200
+  exit 0
+fi
+for f in "$libs"/*/vars/"$AI_NAME".groovy; do
+  [ -e "$f" ] || continue
+  echo "Global step $AI_NAME: $f"
+  help="${f%.groovy}.txt"
+  if [ -e "$help" ]; then echo "Help:"; sed -e 's/<[^>]*>//g' "$help" | head -c 3000; echo; fi
+  echo "call() signatures:"
+  grep -nE -B 8 -A "$AI_CONTEXT" '(^|[^A-Za-z0-9_])(def|void|Object|Map|String|List|boolean)[[:space:]]+call[[:space:]]*\\(' "$f"
+done
+'''
+
+// Agents, labels and tool installations, read from the controller's $JENKINS_HOME.
+// Only readable when the build runs on the controller; on an agent it says so.
+// Reads only these config files, never credentials.xml or secrets/.
+@Field final String JENKINS_INVENTORY_SH = '''#!/bin/sh
+H="$JENKINS_HOME"
+if [ -z "$H" ] || [ ! -r "$H/config.xml" ]; then
+  echo "Can't read the Jenkins configuration from this machine (running on agent '$NODE_NAME')."
+  echo "The agent and tool lists live on the controller, in \\$JENKINS_HOME; run the build on the built-in node to read them."
+  echo "To check one name here instead, try it: tool name: 'node22', type: 'nodejs', or nodesByLabel('node22')."
+  exit 0
+fi
+names_in() { tr -d '\\n\\r' < "$2" | grep -oE "<$1>.*</$1>" | grep -oE '<name>[^<]+</name>' | sed -E 's:</?name>::g' | tr '\\n' ' '; }
+{
+  echo "Agents (name: labels):"
+  for c in "$H"/nodes/*/config.xml; do
+    [ -r "$c" ] || continue
+    printf '  %s: %s\\n' "$(basename "$(dirname "$c")")" "$(sed -n 's:.*<label>\\(.*\\)</label>.*:\\1:p' "$c" | head -n 1)"
+  done
+  echo "Controller and cloud template labels:"
+  printf '  %s\\n' "$(grep -ohE '<(label|labelString|labels)>[^<]+</(label|labelString|labels)>' "$H"/config.xml "$H"/*[Cc]loud*.xml 2>/dev/null \\
+    | sed -E 's/<[^>]+>//g' | tr ' ' '\\n' | grep -v '^$' | sort -u | tr '\\n' ' ')"
+  echo "Tool installations (use as tool name: '<name>', type: '<type>'):"
+  for f in "$H"/*.xml; do
+    grep -q '<installations' "$f" 2>/dev/null || continue
+    t=$(basename "$f" .xml)
+    case "$t" in
+      *NodeJSInstallation) ty=nodejs ;;
+      hudson.tasks.Maven) ty=maven ;;
+      hudson.plugins.gradle.Gradle) ty=gradle ;;
+      *GoInstallation|*golang*) ty=go ;;
+      hudson.plugins.git.GitTool) ty=git ;;
+      *) ty=$t ;;
+    esac
+    printf '  type %s: %s\\n' "$ty" "$(names_in installations "$f")"
+  done
+  jdks=$(names_in jdks "$H/config.xml")
+  [ -n "$jdks" ] && printf '  type jdk: %s\\n' "$jdks"
+} | awk -v f="$AI_FILTER" 'BEGIN { f = tolower(f) } /^  / { if (f == "" || index(tolower($0), f)) print; next } { print }'
+'''
 
 String searchFiles(Map input) {
     if (!input.pattern) error('pattern is required')
